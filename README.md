@@ -1,4 +1,4 @@
-# Rotina Atulizar Instituições Inadimplentes
+# Rotina Atualizar Instituições Inadimplentes
 
 A função `atualizarInstituicoesInadimplentes` pode ser acionada atravez de uma rotina automática do sistema ou manualmente pela plataforma Evando Mira. Ela identifica e marca instituições como inadimplentes com base em certidões vencidas.
 
