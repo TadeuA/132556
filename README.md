@@ -10,7 +10,7 @@ Uma instituição torna-se inadimplente quando:
 
 ## 1. Problemas da Implementação Original
 
-### 1.1. **Ineficiência de Performance**
+### 1.1. **Desempenho de Performance**
 ```php
 //  Implementação original - 3 consultas desnecessárias
 $quantidade = ViewRecuperarInstituicoesInadimplentesIn::
