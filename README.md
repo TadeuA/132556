@@ -13,7 +13,8 @@ Uma instituição torna-se inadimplente quando:
 ### 1.1. **Ineficiência de Performance**
 ```php
 //  Implementação original - 3 consultas desnecessárias
-$quantidade = ViewRecuperarInstituicoesInadimplentesIn::recuperarQuantidadeInstituicoesInadimplentesIn();
+$quantidade = ViewRecuperarInstituicoesInadimplentesIn::
+	recuperarQuantidadeInstituicoesInadimplentesIn();
 if ($quantidade > 0) {
     DB::statement('EXEC ['.env('DB_DATABASE_EVEREST').'].dbo.INSTITUICOESINADIMPLENTESIN');
 }
