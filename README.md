@@ -1,305 +1,281 @@
-# Rotina Atualizar Instituições Inadimplentes
+# Relatório de Problemas Identificados
 
-A função `atualizarInstituicoesInadimplentes` pode ser acionada atravez de uma rotina automática do sistema ou manualmente pela plataforma Evando Mira. Ela identifica e marca instituições como inadimplentes com base em certidões vencidas.
+## Rotina de Correção de Prazos de Relatórios Prorrogados
 
-###### Regra de Negócio
-Uma instituição torna-se inadimplente quando:
-- Possui certidões com data de vencimento anterior à data atual
-- Ainda não está marcada como inadimplente (`INADIMPLENTE = 0`)
-- Está ativa no sistema (`INATIVO = 0` ou `NULL`)
+**Rotina:** `corrigirPrazoRelatorioProcessosProrrogados`
 
-## 1. Problemas da Implementação Original
+**Contexto:** A rotina processa relatórios finais (tipo RMMF) que estão com data de término real do processo superior à data de término de referência do relatório, e que estão em situação aguardando envio (APE, REC, ATRC, ATRB).
 
-### 1.1. **Desempenho de Performance**
+---
+
+## Problemas Críticos
+
+### 1. Projetos curtos podem gerar relatórios com período impossível
+
+#### O que acontece hoje
+
+Quando um processo tem a configuração de "meia execução" (dividir em dois relatórios), o sistema usa uma fórmula fixa que pode resultar em períodos negativos ou zero para o primeiro relatório.
+
+**Trecho do código:**
+
 ```php
-//  Implementação original - 3 consultas desnecessárias
-$quantidade = ViewRecuperarInstituicoesInadimplentesIn::
-	recuperarQuantidadeInstituicoesInadimplentesIn();
-if ($quantidade > 0) {
-    DB::statement('EXEC ['.env('DB_DATABASE_EVEREST').'].dbo.INSTITUICOESINADIMPLENTESIN');
-}
+// Calcula duração do primeiro relatório
+$duracaoPrimeiroRelatorio = (intdiv($duracaoMeses, 2) - 2);
+
+// Exemplo: Processo de 3 meses
+// Resultado: (3 ÷ 2) - 2 = 1 - 2 = -1 mês
 ```
 
-**Problemas:**
-- Executava a **mesma consulta 3 vezes** (1x na view + 2x na procedure)
-- Overhead desnecessário de rede e processamento
-- Consulta redundante apenas para contar registros
+#### Por que isso é um problema
 
-### 1.2. **Transações Aninhadas Desnecessárias**
+- **Datas de início ficam maiores que datas de término** (impossível)
+- **Sistema pode falhar e gerar erros** ao tentar processar essas datas
+- **Pesquisador recebe prazo impossível de cumprir** (relatório de período zero ou negativo)
+
+#### Exemplos práticos
+
+| Duração do Processo | Cálculo            | Duração 1º Relatório | Situação     |
+| ------------------- | ------------------ | -------------------- | ------------ |
+| 6 meses             | (6÷2)-2 = 1 mês    | 1 mês                | Funciona     |
+| 4 meses             | (4÷2)-2 = 0 meses  | 0 meses              | Período zero |
+| 3 meses             | (3÷2)-2 = -0,5 = 0 | 0 meses              | Período zero |
+| 2 meses             | (2÷2)-2 = -1 mês   | Negativo             | Impossível   |
+
+#### Impacto no dia a dia
+
+```
+Processo: Bolsa de Iniciação Científica - 3 meses
+Configuração: Dividir em 2 relatórios (meia execução)
+
+Sistema tenta criar:
+  Relatório 1: 01/01 a 01/01 (0 dias)
+  Relatório 2: 02/01 a 31/03 (todo o período)
+```
+
+#### Dúvidas
+
+1. **Qual deve ser a duração mínima aceitável para um relatório parcial?**
+2. **O que fazer quando o projeto é curto demais para dividir em dois relatórios?**
+3. **Existe regra de negócio que defina quando aplicar ou não a divisão em dois relatórios?**
+
+---
+
+## Problemas de Média Gravidade
+
+### 2. Cálculo de duração pode não corresponder ao esperado em meses
+
+#### O que acontece hoje
+
+O sistema usa duas formas diferentes de trabalhar com "meses":
+
+1. **Para adicionar meses a uma data** - Usa função nativa PHP/SQL que considera meses de calendário
+2. **Para calcular quantos meses** - Usa função customizada que conta meses de calendário
+3. **Para calcular duração do processo** - Divide dias por 30 (média fixa)
+
+**Trechos do código:**
+
 ```php
-//  Transação dupla
-DB::beginTransaction();
-// A procedure também tinha BEGIN TRAN ... COMMIT
-DB::statement('EXEC ...');
-DB::commit();
+// Forma 1: Adicionar meses (usa calendário)
+$dataFinal = date("Y-m-d", strtotime($dataInicio . "+" . $meses . "MONTH"));
+// 01/01 + 6 MONTH = 01/07 (considera calendário)
+
+// Forma 2: Calcular meses entre datas (usa função customizada)
+$quantidadeMeses = Funcoes::calcularDiferencaEntreDatas(
+    $relatorio->dataInicioReferencia,
+    $dataTerminoReal,
+    'mes'
+);
+// Conta meses de calendário (Janeiro = 1, Fevereiro = 2, etc)
+
+// Forma 3: Calcular duração em meses (usa divisão por 30)
+$diferenca = strtotime($dataFim) - strtotime($dataInicio);
+$duracaoMeses = intdiv($diferenca, (30 * 60 * 60 * 24));
+// 181 dias ÷ 30 = 6 meses + 1 dia
 ```
 
-**Problemas:**
-- Redundância de controle transacional
-- Complexidade adicional no gerenciamento de erros
-- Overhead de performance
+#### Como a função calcularDiferencaEntreDatas funciona
 
-### 1.3. **Falta de Dados Precisos**
-A implementação original não retornava a quantidade exata de registros processados, apenas uma estimativa baseada na contagem prévia.
+A função conta quantos meses de calendário existem entre duas datas:
 
-
-### 1.4. **Procedure retornando múltiplos conjuntos de resultados **
-**Problemas:**
-- SQL Server retorna **múltiplos conjuntos de resultados** para comandos como INSERT/UPDATE
-- Cada comando DML retorna uma mensagem de "X linhas afetadas"
-- PHP Laravel fica confuso com múltiplas respostas
-- `DB::statement()` não consegue completar toda a procedure e termina antes do esperado
-
-## 2. Melhorias Implementadas
-
-### 2.1. **Eliminação da Consulta Redundante**
 ```php
-// Implementação otimizada - 1 consulta apenas
-$resultado = DB::select('EXEC ['.env('DB_DATABASE_EVEREST').'].dbo.INSTITUICOESINADIMPLENTESIN');
-$quantidadeRegistrosAfetados = $resultado[0]->QuantidadeAfetada ?? 0;
+// Exemplo: 15/01/2025 a 20/03/2025
+// Conta: Janeiro, Fevereiro, Março = 3 meses
+// Depois subtrai 1 = 2 meses
+
+// Exemplo: 01/01/2025 a 31/03/2025
+// Conta: Janeiro, Fevereiro, Março = 3 meses
+// Depois subtrai 1 = 2 meses
 ```
 
-### 2.2. **Controle Transacional Único**
-A procedure agora é a unica gerenciar a transação, eliminando a duplicidade:
-```sql
--- Na procedure
-BEGIN TRY
-    SET NOCOUNT ON;
-    BEGIN TRAN
-    -- lógica de negócio
-    COMMIT
-END TRY
+**Observação:** Esta função retorna quantidade de meses cheios, não considera dias parciais.
+
+#### Por que isso pode gerar diferenças
+
+**Na maioria dos casos funciona bem**, mas podem haver diferenças dependendo do método usado:
+
+```
+Exemplo 1:
+  Período: 31/01/2025 a 28/02/2025
+
+  Método calendário (calcularDiferencaEntreDatas):
+    Janeiro, Fevereiro = 2 meses - 1 = 1 mês
+
+  Método divisão por 30:
+    28 dias ÷ 30 = 0 meses + 28 dias
+
+Exemplo 2:
+  Período: 01/01/2025 a 01/07/2025
+
+  Método calendário (calcularDiferencaEntreDatas):
+    Jan, Fev, Mar, Abr, Mai, Jun, Jul = 7 - 1 = 6 meses
+
+  Método divisão por 30:
+    181 dias ÷ 30 = 6 meses + 1 dia
+
+  Neste caso coincide!
+
+Exemplo 3:
+  Período: 15/01/2025 a 20/02/2025
+
+  Método calendário (calcularDiferencaEntreDatas):
+    Jan, Fev = 2 - 1 = 1 mês
+
+  Método divisão por 30:
+    36 dias ÷ 30 = 1 mês + 6 dias
+
+  Também coincide!
 ```
 
-### 2.3. **Retorno de Dados Precisos**
-A procedure agora retorna a quantidade exata de registros processados:
-```sql
-SET @QuantidadeAfetada = @@ROWCOUNT
-SELECT @QuantidadeAfetada AS QuantidadeAfetada
+#### Impacto nas decisões do sistema
+
+Este cálculo é usado para:
+
+- Decidir se cria novo relatório ou apenas estende o atual
+- Calcular se ultrapassou o limite de meses configurado no edital
+- Definir quando dividir entre parcial e final
+
+**Consequência potencial:**
+
+```
+Dependendo do método usado, dois processos com mesma duração
+podem ter tratamentos diferentes.
 ```
 
-### 2.4. **Refatoração do Código**
-Extração da lógica de logging para método separado (`registrarExecucaoRotina`), melhorando a organização e reutilização.
+#### Dúvidas
 
-### 2.5. Adição do SET NOCOUNT ON
-```sql
-SET NOCOUNT ON;
-```
-O `SET NOCOUNT ON` suprime as mensagens de "X linhas afetadas", garante que apenas o SELECT final seja retornado e permite que o PHP receba corretamente o resultado da procedure.
+1. **Quando um edital define "relatórios a cada X meses", isso significa X meses de calendário (janeiro, fevereiro, março...) ou X × 30 dias corridos**
 
-## 3. Passo a Passo do Código Atual
+2. **Essa diferença já causou problemas ou questionamentos?**
 
-### 3.1. **Preparação**
-```php
-$usuarioId = $request->header('usuarioId');
-$rotinaSistema = RotinaSistema::recuperarRotinaSistemaAtivaPelaChave('AIIN');
-$dataInicial = Funcoes::retornarDataFormatoBancoDados();
-```
-- Captura dados da requisição
-- Localiza a configuração da rotina no sistema
-- Registra timestamp de início
+---
 
-### 3.2. **Inicialização de Variáveis**
-```php
-$quantidadeRegistrosAfetados = 0;
-$logErro = null;
-$sucesso = 0;
-```
-- Prepara variáveis de controle para logging
+### 3. Sistema pode criar relatórios SEM número (risco baixo, nunca aconteceu)
 
-### 3.3. **Validação da Rotina**
-```php
-if ($rotinaSistema != null) {
-```
-- Verifica se a rotina está cadastrada e ativa no sistema
+#### O que acontece hoje
 
-### 3.4. **Execução Principal**
+Quando o sistema tenta gerar um número para o novo relatório, se ocorrer alguma falha, o erro não é tratado adequadamente.
+
+**Trecho do código:**
+
 ```php
 try {
-    $resultado = DB::select('EXEC ['.env('DB_DATABASE_EVEREST').'].dbo.INSTITUICOESINADIMPLENTESIN');
-    $quantidadeRegistrosAfetados = $resultado[0]->QuantidadeAfetada ?? 0;
-    
-    if ($quantidadeRegistrosAfetados == 0) {
-        $logErro = 'Nenhuma instituição encontrada ou processada';
-    }
-    
-    $sucesso = 1;
-} catch (\Exception $e) {
-    $quantidadeRegistrosAfetados = 0;
-    $logErro = $e->getMessage();
+    $retorno = DB::select('EXEC ['.env('DB_DATABASE_EVEREST')."].dbo.GERARID 'RMM'");
+    return $retorno[0]->CHAVE;
+} catch (\TroubleException $e) {
+    // Não faz nada quando dá erro!
+    // Não lança exceção, não loga, não retorna valor
 }
 ```
-- Executa a procedure otimizada
-- Captura o resultado real de registros processados
-- Trata erros adequadamente
 
-#### 3.4.1 **Procedure INSTITUICOESINADIMPLENTESIN**
-Esta procedure identifica e marca instituições como inadimplentes baseado em certidões com data de vencimento vencida.
-#### 3.4.1.1. Inicialização`
+**Importante:** Este problema **nunca foi reportado** em produção até o momento, mas é uma situação que **pode acontecer** em casos raros de:
+
+- Indisponibilidade momentânea do banco de dados
+- Falha na procedure GERARID
+
+Se acontecer, relatórios sem número não podem ser rastreados adequadamente e documentos oficiais não podem ser gerados.
+
+#### Dúvidas
+
+1. **Considerando que nunca aconteceu, vale a pena implementar tratamento?**
+
+2. **Se acontecer, o que deve ser feito?**
+
+---
+
+### 4. Sistema não valida se quantidade de meses configurada é compatível com o projeto
+
+#### O que acontece hoje
+
+O sistema compara a duração real do projeto com a quantidade de meses configurada no edital, mas não valida se a configuração faz sentido no momento do cadastro.
+
+#### Cenários que podem acontecer
+
+**Cenário 1: Configuração maior que o projeto**
+
+```
+Projeto: 6 meses de duração
+Configuração do edital: Relatórios a cada 12 meses
+
+Resultado:
+  - Sistema sempre vai "apenas estender"
+  - Nunca vai gerar novo relatório, mesmo com múltiplas prorrogações
+```
+
+**Cenário 2: Configuração inconsistente com "meia execução"**
+
+```
+Projeto: 6 meses
+Configuração: Meia execução = SIM + Relatórios a cada 3 meses
+
+Conflito potencial:
+  - "Meia execução" deveria gerar 2 relatórios de 3 meses cada
+  - Mas "a cada 3 meses" também geraria 2 relatórios
+  - Qual regra prevalece em caso de prorrogação?
+```
+
+#### Impacto
+
+- **Comportamento pode ser imprevisível** dependendo da configuração
+- **Erro só é percebido quando processos são prorrogados**
+
+#### Dúvidas
+
+1. **Deve haver validação entre duração do projeto e periodicidade dos relatórios?**
+
+2. **O que prevalece em caso de conflito de configurações?**
+
+3. **Essa situação já aconteceu e causou problemas?**
+
+---
+
+## Problemas de Menor Impacto
+
+### 5. Sistema pode gerar mais de 99.999 relatórios em um ano?
+
+#### O que acontece hoje
+
+O sistema de numeração está preparado para gerar até 99.999 relatórios por ano (formato: RMM-00001-25 até RMM-99999-25).
+
+**Trecho do código SQL:**
+
 ```sql
-BEGIN TRY
-	SET NOCOUNT ON;
-    BEGIN TRAN
-    DECLARE @QuantidadeAfetada INT = 0
-```
-- Define `SET NOCOUNT ON` para otimizar performance
-- Inicia uma transação (`BEGIN TRAN`)
-- Declara variável `@QuantidadeAfetada` para controlar quantos registros foram processados
+-- Calcula quantos zeros colocar antes do número
+SELECT @QTDCARACTERES = (5 - LEN(@VALORSTR))
 
-#### 3.4.1.2. Inserção no Histórico
-```sql   
-    SET DATEFORMAT DMY
-    INSERT INTO INSTITUICOESHISTORICO (IDINSTITUICAO, INADIMPLENTE, USUARIOCRIACAO, DATACRIACAO)
-    SELECT DISTINCT(C.IDINSTITUICAO) AS IDINSTITUICAO, 1, 'SA', GETDATE()
-    FROM CERTIDOES C (NOLOCK)
-    WHERE DATEDIFF(DAY, C.DATAVENCIMENTO, GETDATE()) > 0
-      AND EXISTS (SELECT 1 FROM INSTITUICOES TMP (NOLOCK) 
-                  WHERE TMP.IDINSTITUICAO = C.IDINSTITUICAO 
-                    AND TMP.INADIMPLENTE = 0 
-                    AND (TMP.INATIVO = 0 OR TMP.INATIVO IS NULL))
-```
-- Insere registros na tabela `INSTITUICOESHISTORICO` para cada instituição que deve ser marcada como inadimplente
-- **Critérios de seleção:**
-  - Certidões com `DATAVENCIMENTO` menor que a data atual
-  - Instituições que estão atualmente adimplentes (`INADIMPLENTE = 0`)
-  - Instituições ativas (`INATIVO = 0` ou `INATIVO IS NULL`)
-
-#### 3.4.1.3. Atualização do Status
-  ```sql
-   SET DATEFORMAT DMY
-    UPDATE INSTITUICOES
-    SET INADIMPLENTE = 1
-    WHERE IDINSTITUICAO IN (
-        SELECT DISTINCT(C.IDINSTITUICAO) AS IDINSTITUICAO 
-        FROM CERTIDOES C (NOLOCK)
-        WHERE DATEDIFF(DAY, C.DATAVENCIMENTO, GETDATE()) > 0
-          AND EXISTS (SELECT 1 FROM INSTITUICOES TMP (NOLOCK) 
-                      WHERE TMP.IDINSTITUICAO = C.IDINSTITUICAO 
-                        AND TMP.INADIMPLENTE = 0 
-                        AND (TMP.INATIVO = 0 OR TMP.INATIVO IS NULL))
-    )
-  ```
-- Atualiza o campo `INADIMPLENTE` para `1` nas instituições identificadas
-- Usa os mesmos critérios do passo anterior
-
-#### 3.4.1.4. Obtem a quantidade de registros afetados
-```sql
-    SET @QuantidadeAfetada = @@ROWCOUNT
-```
-- Captura a quantidade de registros afetados com `@@ROWCOUNT`
-
-#### 3.4.1.5. Finalização
-```sql
- COMMIT
-    SELECT @QuantidadeAfetada AS QuantidadeAfetada
-```
-- Confirma a transação (`COMMIT`)
-- Retorna a quantidade de registros processados
-
-#### 3.4.1.6. Tratamento de Erro
-```sql
-    IF @@TRANCOUNT > 0 
-        ROLLBACK
-    SELECT 0 AS QuantidadeAfetada, ERROR_MESSAGE() AS MensagemErro
-```
-- Em caso de erro, executa `ROLLBACK` da transação
-- Retorna `0` como quantidade afetada
-- Retorna descrição do erro
-
-### 3.5. **Logging da Execução**
-```php
-self::registrarExecucaoRotina(
-    $rotinaSistema->id, 
-    $dataInicial, 
-    $dataFinal, 
-    $usuarioId, 
-    $quantidadeRegistrosAfetados, 
-    $sucesso, 
-    $logErro
-);
-```
-- Registra a execução para auditoria e monitoramento
-- Inclui dados precisos sobre o processamento
-
-### 3.6. **Resposta ao Cliente**
-```php
-return response()->json([
-    'mensagem' => $mensagem->mensagem,
-    'quantidadeProcessada' => $quantidadeRegistrosAfetados
-], $mensagem->codigo);
-```
-- Retorna status da execução
-- Inclui quantidade precisa de registros processados
-
-## 4. Queries de Verificação de Sucesso
-
-### 4.1. **Query ANTES de executar a rotina**
-- Verificar quantas instituições serão afetadas
-```sql
-SELECT COUNT(DISTINCT C.IDINSTITUICAO) AS 'Instituições que serão marcadas como inadimplentes'
-FROM CERTIDOES C (NOLOCK)
-WHERE DATEDIFF(DAY, C.DATAVENCIMENTO, GETDATE()) > 0
-  AND EXISTS (SELECT 1 FROM INSTITUICOES TMP (NOLOCK) 
-              WHERE TMP.IDINSTITUICAO = C.IDINSTITUICAO 
-                AND TMP.INADIMPLENTE = 0 
-                AND (TMP.INATIVO = 0 OR TMP.INATIVO IS NULL));
-```
-- Listar as instituições que serão afetadas (com detalhes)
-```sql
-SELECT DISTINCT 
-    I.IDINSTITUICAO,
-    I.NOME,
-    I.INADIMPLENTE AS 'Status Atual',
-    COUNT(C.IDCERTIDAO) AS 'Qtd Certidões Vencidas'
-FROM INSTITUICOES I (NOLOCK)
-INNER JOIN CERTIDOES C (NOLOCK) ON I.IDINSTITUICAO = C.IDINSTITUICAO
-WHERE DATEDIFF(DAY, C.DATAVENCIMENTO, GETDATE()) > 0
-  AND I.INADIMPLENTE = 0 
-  AND (I.INATIVO = 0 OR I.INATIVO IS NULL)
-GROUP BY I.IDINSTITUICAO, I.NOME, I.INADIMPLENTE
-ORDER BY I.NOME;
+-- Se o número precisar de mais de 5 dígitos
+IF @QTDCARACTERES < 0
+BEGIN
+  SELECT NULL  -- Retorna nada
+END
 ```
 
-- Verificar status atual das instituições
-```sql
-SELECT 
-    COUNT(*) AS 'Total Instituições',
-    SUM(CASE WHEN INADIMPLENTE = 1 THEN 1 ELSE 0 END) AS 'Inadimplentes',
-    SUM(CASE WHEN INADIMPLENTE = 0 THEN 1 ELSE 0 END) AS 'Adimplentes'
-FROM INSTITUICOES (NOLOCK)
-WHERE (INATIVO = 0 OR INATIVO IS NULL);
-```
+#### Por que isso provavelmente não é um problema
 
-### 3.4.2. **Query DEPOIS de executar a procedure**
-- Verificar quantas instituições foram processadas
-```sql
-SELECT 
-    COUNT(*) AS 'Total Instituições',
-    SUM(CASE WHEN INADIMPLENTE = 1 THEN 1 ELSE 0 END) AS 'Inadimplentes',
-    SUM(CASE WHEN INADIMPLENTE = 0 THEN 1 ELSE 0 END) AS 'Adimplentes'
-FROM INSTITUICOES (NOLOCK)
-WHERE (INATIVO = 0 OR INATIVO IS NULL);
-```
-- Verificar os registros inseridos no histórico (últimos inseridos)
-```sql
-SELECT TOP 10
-    IH.IDINSTITUICAO,
-    I.NOME,
-    IH.INADIMPLENTE,
-    IH.USUARIOCRIACAO,
-    IH.DATACRIACAO
-FROM INSTITUICOESHISTORICO IH (NOLOCK)
-INNER JOIN INSTITUICOES I (NOLOCK) ON IH.IDINSTITUICAO = I.IDINSTITUICAO
-WHERE IH.USUARIOCRIACAO = 'SA'
-ORDER BY IH.DATACRIACAO DESC;
-```
-- Verificar se não existem mais instituições adimplentes com certidões vencidas
-```sql
-SELECT COUNT(DISTINCT C.IDINSTITUICAO) AS 'Instituições adimplentes com certidões vencidas (deve ser 0)'
-FROM CERTIDOES C (NOLOCK)
-WHERE DATEDIFF(DAY, C.DATAVENCIMENTO, GETDATE()) > 0
-  AND EXISTS (SELECT 1 FROM INSTITUICOES TMP (NOLOCK) 
-              WHERE TMP.IDINSTITUICAO = C.IDINSTITUICAO 
-                AND TMP.INADIMPLENTE = 0 
-                AND (TMP.INATIVO = 0 OR TMP.INATIVO IS NULL));
-```
+- **Volume atual não chega perto** de 100.000 relatórios/ano
+- **Crescimento esperado não indica risco** em curto/médio prazo
+- **Seria necessário crescimento** de mais de 270 relatórios por dia útil
+
+**Mas é importante saber que existe:**
+Se algum dia chegasse a 99.999, o próximo retornaria NULL e seria criado sem número.
+
+---
